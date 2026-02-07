@@ -1,0 +1,700 @@
+"""
+Advanced Time Series Forecasting with Attention-Based LSTMs and Backtesting
+-------------------------------------------------------------------------
+
+Deliverables covered:
+1) Programmatic dataset generation (non-stationary, trend+seasonality+regime shifts), >= 1000 points
+2) Baseline seq2seq LSTM model + metrics (RMSE/MAE)
+3) Attention-based seq2seq LSTM model with interpretable attention weights
+4) Walk-forward expanding window backtesting framework
+5) Interpretation of attention weights across folds
+
+Dependencies:
+- numpy
+- pandas
+- tensorflow (keras)
+- scikit-learn
+- matplotlib (optional for plots)
+
+Run:
+    python attention_lstm_backtest.py
+
+Notes:
+- This is written to be production-friendly: clear functions, reproducibility, and no notebook-only hacks.
+"""
+
+from __future__ import annotations
+
+import os
+import math
+import json
+import random
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+
+
+# ----------------------------
+# Reproducibility
+# ----------------------------
+def set_global_seed(seed: int = 42) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+# ----------------------------
+# Dataset generation
+# ----------------------------
+def generate_nonstationary_series(
+    n: int = 5000,
+    seed: int = 42,
+    freq: str = "T",  # min-level index; purely illustrative
+) -> pd.DataFrame:
+    """
+    Generates a complex single-variable time series:
+    - nonlinear trend
+    - multiple seasonalities
+    - regime shifts (level + drift changes)
+    - heteroskedastic noise (volatility changes)
+    - occasional shocks
+
+    Returns DataFrame with columns: ["timestamp", "y"]
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+
+    # Nonlinear trend
+    trend = 0.0005 * (t ** 1.15) + 0.02 * np.sin(2 * np.pi * t / 1500)
+
+    # Multiple seasonalities (e.g., intraday + weekly-like)
+    s1 = 0.8 * np.sin(2 * np.pi * t / 60)         # short seasonality
+    s2 = 0.4 * np.sin(2 * np.pi * t / 360)        # medium
+    s3 = 0.25 * np.sin(2 * np.pi * t / 1440)      # long
+
+    # Regime shifts: piecewise offsets and drift
+    regime_points = [int(n * 0.2), int(n * 0.45), int(n * 0.7), int(n * 0.85)]
+    offsets = [0.0, 1.2, -0.8, 1.8, 0.6]
+    drifts = [0.0, 0.0002, -0.00015, 0.00035, -0.0001]
+
+    level = np.zeros(n, dtype=float)
+    current = 0.0
+    last_cp = 0
+    cps = regime_points + [n]
+    for i, cp in enumerate(cps):
+        seg = np.arange(last_cp, cp)
+        seg_len = len(seg)
+        current_offset = offsets[i]
+        current_drift = drifts[i]
+        level[seg] = current_offset + current_drift * np.arange(seg_len)
+        last_cp = cp
+
+    # Volatility changes (heteroskedastic)
+    vol = np.ones(n) * 0.15
+    vol[int(n * 0.35): int(n * 0.55)] = 0.35
+    vol[int(n * 0.55): int(n * 0.75)] = 0.22
+    vol[int(n * 0.75):] = 0.45
+
+    noise = rng.normal(loc=0.0, scale=vol, size=n)
+
+    # Occasional shocks
+    shock = np.zeros(n)
+    shock_idx = rng.choice(np.arange(50, n - 50), size=max(8, n // 700), replace=False)
+    for idx in shock_idx:
+        shock[idx: idx + 5] += rng.normal(0, 1.0) * np.linspace(1.0, 0.2, 5)
+
+    y = trend + (s1 + s2 + s3) + level + noise + shock
+
+    # A realistic "price-like" transform (kept continuous)
+    y = 10 + y
+    # Ensure no weird negatives for "price-ish" scenarios
+    y = np.maximum(y, 0.1)
+
+    ts = pd.date_range("2024-01-01", periods=n, freq=freq)
+    df = pd.DataFrame({"timestamp": ts, "y": y})
+    return df
+
+
+# ----------------------------
+# Windowing for seq2seq
+# ----------------------------
+def make_supervised_windows(
+    y: np.ndarray,
+    lookback: int,
+    horizon: int,
+    stride: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Converts 1D series into seq2seq:
+      X: (num_samples, lookback, 1)
+      Y: (num_samples, horizon, 1)
+    """
+    X, Y = [], []
+    n = len(y)
+    end = n - lookback - horizon + 1
+    for i in range(0, end, stride):
+        x = y[i: i + lookback]
+        yy = y[i + lookback: i + lookback + horizon]
+        X.append(x.reshape(-1, 1))
+        Y.append(yy.reshape(-1, 1))
+    return np.asarray(X), np.asarray(Y)
+
+
+# ----------------------------
+# Metrics
+# ----------------------------
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(math.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(mean_absolute_error(y_true, y_pred))
+
+
+# ----------------------------
+# Models
+# ----------------------------
+def build_baseline_seq2seq_lstm(
+    lookback: int,
+    horizon: int,
+    units: int = 64,
+    dropout: float = 0.1,
+    lr: float = 1e-3,
+) -> Model:
+    """
+    Baseline seq2seq:
+      Encoder LSTM -> RepeatVector(horizon) -> Decoder LSTM -> TimeDistributed(Dense(1))
+    """
+    encoder_inputs = layers.Input(shape=(lookback, 1), name="encoder_inputs")
+
+    x = layers.LSTM(units, dropout=dropout, return_sequences=False, name="encoder_lstm")(encoder_inputs)
+    x = layers.RepeatVector(horizon, name="repeat_to_horizon")(x)
+    x = layers.LSTM(units, dropout=dropout, return_sequences=True, name="decoder_lstm")(x)
+    outputs = layers.TimeDistributed(layers.Dense(1), name="y_hat")(x)
+
+    model = Model(encoder_inputs, outputs, name="baseline_seq2seq_lstm")
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr), loss="mse")
+    return model
+
+
+def build_attention_seq2seq_lstm(
+    lookback: int,
+    horizon: int,
+    enc_units: int = 64,
+    dec_units: int = 64,
+    dropout: float = 0.1,
+    lr: float = 1e-3,
+) -> Model:
+    """
+    Attention seq2seq:
+      Encoder LSTM (return_sequences=True)
+      Decoder LSTM (over repeated context)
+      AdditiveAttention(query=decoder_outputs, value=encoder_outputs) -> context + decoder_outputs -> Dense
+
+    We also output attention scores for interpretation.
+
+    Returns a model with TWO outputs:
+      1) forecast: (batch, horizon, 1)
+      2) attn_scores: (batch, horizon, lookback)
+    """
+    encoder_inputs = layers.Input(shape=(lookback, 1), name="encoder_inputs")
+
+    encoder_outputs = layers.LSTM(
+        enc_units,
+        dropout=dropout,
+        return_sequences=True,
+        name="encoder_lstm",
+    )(encoder_inputs)
+
+    # A simple decoder input: repeat the last encoder output summary (or mean) to horizon
+    encoder_summary = layers.Lambda(lambda z: tf.reduce_mean(z, axis=1), name="encoder_summary")(encoder_outputs)
+    decoder_inputs = layers.RepeatVector(horizon, name="decoder_inputs")(encoder_summary)
+
+    decoder_outputs = layers.LSTM(
+        dec_units,
+        dropout=dropout,
+        return_sequences=True,
+        name="decoder_lstm",
+    )(decoder_inputs)
+
+    # Additive attention: scores shape (batch, horizon, lookback)
+    attn_layer = layers.AdditiveAttention(name="additive_attention")
+    # Keras AdditiveAttention supports returning attention scores via call(..., return_attention_scores=True)
+    context, scores = attn_layer(
+        [decoder_outputs, encoder_outputs],
+        return_attention_scores=True,
+    )
+
+    # Combine context with decoder outputs
+    combined = layers.Concatenate(name="context_plus_decoder")([decoder_outputs, context])
+    combined = layers.TimeDistributed(layers.Dense(dec_units, activation="relu"), name="proj")(combined)
+    forecast = layers.TimeDistributed(layers.Dense(1), name="y_hat")(combined)
+
+    model = Model(inputs=encoder_inputs, outputs=[forecast, scores], name="attention_seq2seq_lstm")
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+        loss={"y_hat": "mse", "additive_attention": None},  # we don't train on scores
+        # Keras wants a loss for each output; simplest is to pass a dummy for scores at fit-time.
+    )
+    return model
+
+
+# ----------------------------
+# Training helpers
+# ----------------------------
+@dataclass
+class TrainConfig:
+    lookback: int = 120
+    horizon: int = 12
+    batch_size: int = 64
+    epochs: int = 30
+    patience: int = 6
+    val_split: float = 0.15
+
+    # baseline
+    base_units: int = 64
+    base_dropout: float = 0.1
+    base_lr: float = 1e-3
+
+    # attention
+    enc_units: int = 64
+    dec_units: int = 64
+    attn_dropout: float = 0.1
+    attn_lr: float = 1e-3
+
+
+def fit_model(
+    model: Model,
+    X_train: np.ndarray,
+    Y_train: np.ndarray,
+    batch_size: int,
+    epochs: int,
+    patience: int,
+    val_split: float,
+    is_attention_model: bool,
+    verbose: int = 0,
+) -> tf.keras.callbacks.History:
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=patience,
+            restore_best_weights=True,
+        )
+    ]
+
+    if not is_attention_model:
+        history = model.fit(
+            X_train,
+            Y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_split=val_split,
+            callbacks=callbacks,
+            verbose=verbose,
+        )
+        return history
+
+    # Attention model has two outputs; we only have Y for forecast.
+    # Provide dummy zeros for attention scores so fit() is satisfied.
+    dummy_scores = np.zeros((X_train.shape[0], Y_train.shape[1], X_train.shape[1]), dtype=np.float32)
+
+    history = model.fit(
+        X_train,
+        {"y_hat": Y_train, "additive_attention": dummy_scores},
+        batch_size=batch_size,
+        epochs=epochs,
+        validation_split=val_split,
+        callbacks=callbacks,
+        verbose=verbose,
+    )
+    return history
+
+
+def predict_model(
+    model: Model,
+    X: np.ndarray,
+    is_attention_model: bool,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if not is_attention_model:
+        yhat = model.predict(X, verbose=0)
+        return yhat, None
+
+    forecast, scores = model.predict(X, verbose=0)
+    return forecast, scores
+
+
+# ----------------------------
+# Walk-forward backtesting
+# ----------------------------
+@dataclass
+class BacktestConfig:
+    initial_train_size: int = 2500  # number of raw points used initially
+    test_size: int = 600            # raw points per fold segment
+    step_size: int = 600            # expand by this amount each fold
+    stride_in_windows: int = 1      # window stride (1 = max samples)
+
+
+def prepare_fold_windows(
+    y_scaled: np.ndarray,
+    train_end_idx: int,
+    test_end_idx: int,
+    lookback: int,
+    horizon: int,
+    stride: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Creates supervised windows for train and test segments using raw index cutoffs.
+    """
+    y_train = y_scaled[:train_end_idx]
+    y_test = y_scaled[train_end_idx:test_end_idx]
+
+    Xtr, Ytr = make_supervised_windows(y_train, lookback, horizon, stride=stride)
+
+    # For test we need enough context, so we prepend the last lookback points from train
+    context = y_scaled[train_end_idx - lookback:train_end_idx]
+    y_test_with_context = np.concatenate([context, y_test], axis=0)
+    Xte, Yte = make_supervised_windows(y_test_with_context, lookback, horizon, stride=stride)
+
+    return Xtr, Ytr, Xte, Yte
+
+
+def run_backtest(
+    y: np.ndarray,
+    train_cfg: TrainConfig,
+    bt_cfg: BacktestConfig,
+    use_attention: bool,
+    verbose: int = 0,
+) -> Dict:
+    """
+    Expanding window walk-forward backtest.
+
+    Important: scaling is fit on each fold's training segment only (no leakage),
+    then applied to test segment windows.
+    """
+    lookback = train_cfg.lookback
+    horizon = train_cfg.horizon
+
+    results = {
+        "use_attention": use_attention,
+        "folds": [],
+        "overall": {},
+    }
+
+    n = len(y)
+    train_end = bt_cfg.initial_train_size
+    fold_id = 0
+
+    while True:
+        test_end = min(train_end + bt_cfg.test_size, n)
+        if test_end <= train_end + lookback + horizon:
+            break
+
+        fold_id += 1
+
+        # Fit scaler ONLY on training part (no leakage)
+        scaler = StandardScaler()
+        y_train_raw = y[:train_end].reshape(-1, 1)
+        scaler.fit(y_train_raw)
+
+        y_scaled = scaler.transform(y.reshape(-1, 1)).astype(np.float32).reshape(-1)
+
+        Xtr, Ytr, Xte, Yte = prepare_fold_windows(
+            y_scaled=y_scaled,
+            train_end_idx=train_end,
+            test_end_idx=test_end,
+            lookback=lookback,
+            horizon=horizon,
+            stride=bt_cfg.stride_in_windows,
+        )
+
+        if use_attention:
+            model = build_attention_seq2seq_lstm(
+                lookback=lookback,
+                horizon=horizon,
+                enc_units=train_cfg.enc_units,
+                dec_units=train_cfg.dec_units,
+                dropout=train_cfg.attn_dropout,
+                lr=train_cfg.attn_lr,
+            )
+        else:
+            model = build_baseline_seq2seq_lstm(
+                lookback=lookback,
+                horizon=horizon,
+                units=train_cfg.base_units,
+                dropout=train_cfg.base_dropout,
+                lr=train_cfg.base_lr,
+            )
+
+        # Train
+        _ = fit_model(
+            model=model,
+            X_train=Xtr,
+            Y_train=Ytr,
+            batch_size=train_cfg.batch_size,
+            epochs=train_cfg.epochs,
+            patience=train_cfg.patience,
+            val_split=train_cfg.val_split,
+            is_attention_model=use_attention,
+            verbose=verbose,
+        )
+
+        # Predict
+        yhat_scaled, attn_scores = predict_model(model, Xte, is_attention_model=use_attention)
+
+        # Inverse scale predictions and targets for metrics in original scale
+        # Shapes: (samples, horizon, 1)
+        yhat = scaler.inverse_transform(yhat_scaled.reshape(-1, 1)).reshape(yhat_scaled.shape)
+        ytrue = scaler.inverse_transform(Yte.reshape(-1, 1)).reshape(Yte.shape)
+
+        # Evaluate on ALL steps (flatten)
+        yhat_flat = yhat.reshape(-1)
+        ytrue_flat = ytrue.reshape(-1)
+
+        fold_rmse = rmse(ytrue_flat, yhat_flat)
+        fold_mae = mae(ytrue_flat, yhat_flat)
+
+        fold_info = {
+            "fold": fold_id,
+            "train_end_idx": int(train_end),
+            "test_end_idx": int(test_end),
+            "num_train_windows": int(Xtr.shape[0]),
+            "num_test_windows": int(Xte.shape[0]),
+            "rmse": fold_rmse,
+            "mae": fold_mae,
+        }
+
+        # Summarize attention importance if available
+        if use_attention and attn_scores is not None:
+            # attn_scores shape: (samples, horizon, lookback)
+            # average across samples and horizon -> (lookback,)
+            attn_mean = attn_scores.mean(axis=(0, 1))
+            # normalize for interpretability
+            attn_mean = attn_mean / (attn_mean.sum() + 1e-9)
+            fold_info["attention_mean"] = attn_mean.tolist()
+
+            # Simple interpretation: top-k past lags
+            topk = 10 if lookback >= 10 else lookback
+            top_idx = np.argsort(attn_mean)[-topk:][::-1]
+            fold_info["attention_top_lags"] = [
+                {"lag": int(lookback - 1 - i), "weight": float(attn_mean[i])}
+                for i in top_idx
+            ]
+
+        results["folds"].append(fold_info)
+
+        # Expand training window
+        if test_end == n:
+            break
+        train_end = min(train_end + bt_cfg.step_size, n)
+
+    # Overall summary
+    rmses = [f["rmse"] for f in results["folds"]]
+    maes = [f["mae"] for f in results["folds"]]
+    results["overall"] = {
+        "num_folds": len(results["folds"]),
+        "rmse_mean": float(np.mean(rmses)) if rmses else None,
+        "rmse_std": float(np.std(rmses)) if rmses else None,
+        "mae_mean": float(np.mean(maes)) if maes else None,
+        "mae_std": float(np.std(maes)) if maes else None,
+    }
+    return results
+
+
+# ----------------------------
+# Optional: light hyperparameter search
+# ----------------------------
+def quick_tune_attention(
+    y: np.ndarray,
+    train_cfg: TrainConfig,
+    bt_cfg: BacktestConfig,
+    search_space: Dict[str, List],
+    max_trials: int = 6,
+) -> TrainConfig:
+    """
+    Very small, practical tuning loop:
+    - tries a few combinations
+    - uses backtest mean RMSE as objective
+    Keeps it simple and reproducible (good for assignments).
+    """
+    keys = list(search_space.keys())
+    combos = []
+
+    def backtrack(i: int, cur: dict):
+        if len(combos) >= max_trials:
+            return
+        if i == len(keys):
+            combos.append(cur.copy())
+            return
+        k = keys[i]
+        for v in search_space[k]:
+            cur[k] = v
+            backtrack(i + 1, cur)
+            if len(combos) >= max_trials:
+                return
+
+    backtrack(0, {})
+
+    best_cfg = train_cfg
+    best_score = float("inf")
+
+    for trial, params in enumerate(combos, start=1):
+        cfg = TrainConfig(**{**train_cfg.__dict__, **params})
+        res = run_backtest(y, cfg, bt_cfg, use_attention=True, verbose=0)
+        score = res["overall"]["rmse_mean"]
+        if score is not None and score < best_score:
+            best_score = score
+            best_cfg = cfg
+
+        print(f"[TUNE] Trial {trial}/{len(combos)} params={params} rmse_mean={score}")
+
+    print(f"[TUNE] Best rmse_mean={best_score} with cfg={best_cfg}")
+    return best_cfg
+
+
+# ----------------------------
+# Main execution
+# ----------------------------
+def main():
+    set_global_seed(42)
+
+    # 1) Data
+    df = generate_nonstationary_series(n=5200, seed=42, freq="T")
+    y = df["y"].values.astype(np.float32)
+
+    # 2) Configs
+    train_cfg = TrainConfig(
+        lookback=120,     # past timesteps
+        horizon=12,       # forecast next 12
+        batch_size=64,
+        epochs=25,
+        patience=5,
+        val_split=0.15,
+
+        base_units=64,
+        base_dropout=0.1,
+        base_lr=1e-3,
+
+        enc_units=64,
+        dec_units=64,
+        attn_dropout=0.1,
+        attn_lr=1e-3,
+    )
+
+    bt_cfg = BacktestConfig(
+        initial_train_size=2600,
+        test_size=650,
+        step_size=650,
+        stride_in_windows=1,
+    )
+
+    # (Optional) quick tuning for attention model
+    # Comment out if not needed
+    # search_space = {
+    #     "enc_units": [48, 64],
+    #     "dec_units": [48, 64],
+    #     "attn_dropout": [0.1, 0.2],
+    #     "attn_lr": [1e-3, 5e-4],
+    # }
+    # train_cfg = quick_tune_attention(y, train_cfg, bt_cfg, search_space, max_trials=6)
+
+    # 3) Baseline backtest
+    baseline_results = run_backtest(
+        y=y,
+        train_cfg=train_cfg,
+        bt_cfg=bt_cfg,
+        use_attention=False,
+        verbose=0,
+    )
+
+    # 4) Attention backtest
+    attention_results = run_backtest(
+        y=y,
+        train_cfg=train_cfg,
+        bt_cfg=bt_cfg,
+        use_attention=True,
+        verbose=0,
+    )
+
+    # 5) Print comparison report (text-based)
+    print("\n==================== BACKTEST SUMMARY ====================")
+    print("Baseline (Seq2Seq LSTM, no attention):")
+    print(json.dumps(baseline_results["overall"], indent=2))
+
+    print("\nAttention (Seq2Seq LSTM + AdditiveAttention):")
+    print(json.dumps(attention_results["overall"], indent=2))
+
+    # Fold-wise table
+    def folds_table(res: Dict) -> pd.DataFrame:
+        rows = []
+        for f in res["folds"]:
+            rows.append({
+                "fold": f["fold"],
+                "train_end": f["train_end_idx"],
+                "test_end": f["test_end_idx"],
+                "rmse": f["rmse"],
+                "mae": f["mae"],
+            })
+        return pd.DataFrame(rows)
+
+    df_base = folds_table(baseline_results)
+    df_attn = folds_table(attention_results)
+
+    print("\nBaseline folds:\n", df_base.to_string(index=False))
+    print("\nAttention folds:\n", df_attn.to_string(index=False))
+
+    # 6) Attention interpretation (aggregate across folds)
+    # We will average attention_mean (length lookback) across folds.
+    attn_means = []
+    top_lags_all = []
+
+    for f in attention_results["folds"]:
+        if "attention_mean" in f:
+            attn_means.append(np.array(f["attention_mean"], dtype=float))
+            top_lags_all.append(f.get("attention_top_lags", []))
+
+    if attn_means:
+        attn_avg = np.mean(attn_means, axis=0)
+        attn_avg = attn_avg / (attn_avg.sum() + 1e-9)
+
+        topk = 12 if train_cfg.lookback >= 12 else train_cfg.lookback
+        top_idx = np.argsort(attn_avg)[-topk:][::-1]
+
+        print("\n==================== ATTENTION INTERPRETATION ====================")
+        print("Interpretation: higher weight = model focused more on that past timestep.")
+        print("Lag definition: lag=0 is the most recent point in the lookback window.")
+
+        print("\nTop lags overall (averaged across folds):")
+        for i in top_idx:
+            lag = int(train_cfg.lookback - 1 - i)  # convert index -> lag from most recent
+            print(f"  lag={lag:>3}  weight={attn_avg[i]:.4f}")
+
+        # Optional: save attention avg to CSV for your report
+        out = pd.DataFrame({
+            "lookback_index": np.arange(train_cfg.lookback),
+            "lag_from_most_recent": (train_cfg.lookback - 1 - np.arange(train_cfg.lookback)),
+            "attention_weight": attn_avg,
+        })
+        out.to_csv("attention_weights_avg.csv", index=False)
+        print("\nSaved: attention_weights_avg.csv")
+
+    # 7) Save results for documentation
+    with open("baseline_results.json", "w", encoding="utf-8") as f:
+        json.dump(baseline_results, f, indent=2)
+    with open("attention_results.json", "w", encoding="utf-8") as f:
+        json.dump(attention_results, f, indent=2)
+    print("\nSaved: baseline_results.json, attention_results.json")
+    print("===========================================================\n")
+
+
+if __name__ == "__main__":
+    main()
